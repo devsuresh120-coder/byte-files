@@ -1,0 +1,78 @@
+name: Post long episodes on TikTok
+
+# PUBLIC repo: only code lives here. All data (schedule, kits, videos, tokens, logs) is in the PRIVATE repo
+# social-hub under data/byte-files/. This job checks it out with HUB_TOKEN, runs the code against that folder,
+# saves results + a private log back to social-hub, and prints only a status line (public logs never show data).
+on:
+  schedule:
+    - cron: "20 18,19,5 * * *"   # 23:50, 00:50, 10:50 Sri Lanka
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "check | dry-run | test | inbox-test | status | publish"
+        default: "check"
+      episode:
+        description: "episode number (test / publish), or the publish_id for status"
+        default: ""
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  job:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: devsuresh120-coder/social-hub
+          token: ${{ secrets.HUB_TOKEN }}
+          path: hub
+          sparse-checkout: data/byte-files
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Put the code next to the data (not committed)
+        run: cp -r publish tools hub/data/byte-files/
+      - run: pip install -q requests cryptography > /dev/null
+      - name: Post on TikTok (output goes to the private log only)
+        working-directory: hub/data/byte-files
+        env:
+          TT_CLIENT_KEY: ${{ secrets.TT_CLIENT_KEY }}
+          TT_CLIENT_SECRET: ${{ secrets.TT_CLIENT_SECRET }}
+          TT_AUTO: ${{ vars.TT_AUTO || secrets.TT_AUTO }}
+          TT_PRIVACY: ${{ vars.TT_PRIVACY || 'SELF_ONLY' }}
+          DRY_RUN: ${{ github.event.inputs.action == 'dry-run' && '1' || '' }}
+          TEST_MODE: ${{ (github.event.inputs.action == 'test' || github.event.inputs.action == 'inbox-test') && '1' || '' }}
+          TT_MODE: ${{ github.event.inputs.action == 'inbox-test' && 'inbox' || vars.TT_MODE || 'direct' }}
+          TEST_EPISODE: ${{ github.event.inputs.episode }}
+          STATUS_ID: ${{ github.event.inputs.action == 'status' && github.event.inputs.episode || '' }}
+          CHECK_ONLY: ${{ github.event.inputs.action == 'check' && '1' || '' }}
+          ONLY_EPISODE: ${{ github.event.inputs.action == 'publish' && github.event.inputs.episode || '' }}
+        run: |
+          mkdir -p logs; LOG="logs/publish-tiktok_$(date -u +%Y%m%d_%H%M%S).txt"
+          set +e
+          {
+            python publish/publish_tiktok.py
+          } > "$LOG" 2>&1
+          code=$?
+          ls -1t logs/publish-tiktok_*.txt | tail -n +31 | xargs -r rm -f   # keep the last 30 logs
+          echo "STATUS=$code" >> "$GITHUB_ENV"
+          if [ $code -eq 0 ]; then echo "publish-tiktok: ok"; else echo "::error::publish-tiktok failed (details in social-hub/data/byte-files/$LOG)"; fi
+      - name: Save results to social-hub (private)
+        if: always()
+        working-directory: hub
+        run: |
+          git config user.name "byte-files-bot"
+          git config user.email "bot@users.noreply.github.com"
+          for p in data/byte-files/logs data/byte-files/queue/posted.json data/byte-files/queue/tt_token.enc; do git add -A -f "$p" > /dev/null 2>&1 || true; done
+          if ! git diff --cached --quiet; then
+            git commit -qm "byte-files: long episodes on TikTok [skip ci]"
+            for i in 1 2 3 4 5; do git pull -q --rebase --autostash && git push -q && break; sleep 5; done
+          fi
+          exit "${STATUS:-0}"

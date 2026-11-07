@@ -1,0 +1,74 @@
+name: Publish Shorts (+ long TikTok) to Buffer
+
+# PUBLIC repo: only code lives here. All data (schedule, kits, videos, tokens, logs) is in the PRIVATE repo
+# social-hub under data/byte-files/. This job checks it out with HUB_TOKEN, runs the code against that folder,
+# saves results + a private log back to social-hub, and prints only a status line (public logs never show data).
+on:
+  schedule:
+    - cron: "23 2,14 * * *"   # twice a day (Buffer posts are made 6 days ahead)
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "publish | list-channels | dry-run | status | reschedule | introspect | tiktok-long"
+        default: "publish"
+      episode:
+        description: "tiktok-long: the long episode number to send to TikTok via Buffer"
+        default: ""
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  job:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: devsuresh120-coder/social-hub
+          token: ${{ secrets.HUB_TOKEN }}
+          path: hub
+          sparse-checkout: data/byte-files
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Put the code next to the data (not committed)
+        run: cp -r publish tools hub/data/byte-files/
+      - run: pip install -q requests > /dev/null
+      - name: Publish Shorts (output goes to the private log only)
+        working-directory: hub/data/byte-files
+        env:
+          BUFFER_ACCESS_TOKEN: ${{ secrets.BUFFER_ACCESS_TOKEN || secrets.BUFFER_API_KEY || secrets.BUFFER_TOKEN || secrets.BUFFER_API_TOKEN }}
+          ACTION: ${{ github.event.inputs.action || 'publish' }}
+          DRY_RUN: ${{ github.event.inputs.action == 'dry-run' && '1' || '' }}
+          LIST_ONLY: ${{ github.event.inputs.action == 'list-channels' && '1' || '' }}
+          LONG_TIKTOK_EP: ${{ github.event.inputs.action == 'tiktok-long' && github.event.inputs.episode || '' }}
+        run: |
+          mkdir -p logs; LOG="logs/publish_$(date -u +%Y%m%d_%H%M%S).txt"
+          set +e
+          {
+            if [ "$ACTION" = "status" ]; then python publish/status.py
+            elif [ "$ACTION" = "introspect" ]; then INTROSPECT=1 python publish/status.py
+            elif [ "$ACTION" = "reschedule" ] || [ "$ACTION" = "dry-run" ]; then python publish/reschedule.py && python publish/publish.py
+            else python publish/publish.py; fi
+          } > "$LOG" 2>&1
+          code=$?
+          ls -1t logs/publish_*.txt | tail -n +31 | xargs -r rm -f   # keep the last 30 logs
+          echo "STATUS=$code" >> "$GITHUB_ENV"
+          if [ $code -eq 0 ]; then echo "publish: ok"; else echo "::error::publish failed (details in social-hub/data/byte-files/$LOG)"; fi
+      - name: Save results to social-hub (private)
+        if: always()
+        working-directory: hub
+        run: |
+          git config user.name "byte-files-bot"
+          git config user.email "bot@users.noreply.github.com"
+          for p in data/byte-files/logs data/byte-files/queue/posted.json; do git add -A -f "$p" > /dev/null 2>&1 || true; done
+          if ! git diff --cached --quiet; then
+            git commit -qm "byte-files: Shorts sent to Buffer [skip ci]"
+            for i in 1 2 3 4 5; do git pull -q --rebase --autostash && git push -q && break; sleep 5; done
+          fi
+          exit "${STATUS:-0}"

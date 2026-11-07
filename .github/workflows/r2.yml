@@ -1,0 +1,60 @@
+name: Copy media to R2
+
+# PUBLIC repo: only code. Claude pushes a temporary branch upload/<name> to the PRIVATE repo social-hub that adds
+# data/byte-files/_upload/<folder>/<files>. This job (every 10 min, or run by hand) finds such branches, copies the
+# files to R2 byte-files/<folder>/, records the links in social-hub data/byte-files/queue/r2.json, and deletes the branch.
+# Public logs show only counts; file names go to the private log.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: r2
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  job:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: devsuresh120-coder/social-hub
+          token: ${{ secrets.HUB_TOKEN }}
+          path: hub
+          sparse-checkout: data/byte-files
+      - name: Look for upload branches
+        id: find
+        working-directory: hub
+        run: |
+          git ls-remote --heads origin 'refs/heads/upload/*' | awk '{print $2}' | sed 's#refs/heads/##' > ../branches.txt
+          if [ -s ../branches.txt ]; then echo "found=1" >> "$GITHUB_OUTPUT"; echo "r2: $(wc -l < ../branches.txt) upload branch(es)"; else echo "found=0" >> "$GITHUB_OUTPUT"; echo "r2: nothing to do"; fi
+      - if: steps.find.outputs.found == '1'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - if: steps.find.outputs.found == '1'
+        name: Upload (output goes to the private log only)
+        working-directory: hub
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+        run: |
+          pip install -q boto3 > /dev/null
+          git config user.name "byte-files-bot"; git config user.email "bot@users.noreply.github.com"
+          mkdir -p data/byte-files/logs; LOG="data/byte-files/logs/r2_$(date -u +%Y%m%d_%H%M%S).txt"
+          FAIL=0; N=0
+          for B in $(cat ../branches.txt); do
+            if bash ../tools/r2_branch.sh "$B" >> "$LOG" 2>&1; then N=$((N+1)); else FAIL=1; git reset -q --hard HEAD 2>/dev/null; fi
+          done
+          ls -1t data/byte-files/logs/r2_*.txt | tail -n +31 | xargs -r rm -f
+          git add -A data/byte-files/logs > /dev/null 2>&1 || true
+          if ! git diff --cached --quiet; then git commit -qm "byte-files: r2 log [skip ci]"; for i in 1 2 3 4 5; do git pull -q --rebase --autostash && git push -q && break; sleep 5; done; fi
+          if [ $FAIL -eq 0 ]; then echo "r2: ok ($N branch(es))"; else echo "::error::r2 failed (details in social-hub/data/byte-files/logs)"; exit 1; fi

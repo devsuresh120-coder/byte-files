@@ -1,0 +1,61 @@
+name: R2 organize
+
+# PUBLIC repo: only code lives here. All data (schedule, kits, videos, tokens, logs) is in the PRIVATE repo
+# social-hub under data/byte-files/. This job checks it out with HUB_TOKEN, runs the code against that folder,
+# saves results + a private log back to social-hub, and prints only a status line (public logs never show data).
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: r2-organize
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  job:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: devsuresh120-coder/social-hub
+          token: ${{ secrets.HUB_TOKEN }}
+          path: hub
+          sparse-checkout: data/byte-files
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Put the code next to the data (not committed)
+        run: cp -r publish tools hub/data/byte-files/
+      - run: pip install -q boto3 > /dev/null
+      - name: R2 listing (output goes to the private log only)
+        working-directory: hub/data/byte-files
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          mkdir -p logs; LOG="logs/r2-organize_$(date -u +%Y%m%d_%H%M%S).txt"
+          set +e
+          {
+            python tools/r2_organize.py
+          } > "$LOG" 2>&1
+          code=$?
+          ls -1t logs/r2-organize_*.txt | tail -n +31 | xargs -r rm -f   # keep the last 30 logs
+          echo "STATUS=$code" >> "$GITHUB_ENV"
+          if [ $code -eq 0 ]; then echo "r2-organize: ok"; else echo "::error::r2-organize failed (details in social-hub/data/byte-files/$LOG)"; fi
+      - name: Save results to social-hub (private)
+        if: always()
+        working-directory: hub
+        run: |
+          git config user.name "byte-files-bot"
+          git config user.email "bot@users.noreply.github.com"
+          for p in data/byte-files/logs data/byte-files/queue/r2_listing.txt; do git add -A -f "$p" > /dev/null 2>&1 || true; done
+          if ! git diff --cached --quiet; then
+            git commit -qm "byte-files: R2 listing [skip ci]"
+            for i in 1 2 3 4 5; do git pull -q --rebase --autostash && git push -q && break; sleep 5; done
+          fi
+          exit "${STATUS:-0}"

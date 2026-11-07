@@ -1,0 +1,74 @@
+name: Schedule long episodes on Facebook
+
+# PUBLIC repo: only code lives here. All data (schedule, kits, videos, tokens, logs) is in the PRIVATE repo
+# social-hub under data/byte-files/. This job checks it out with HUB_TOKEN, runs the code against that folder,
+# saves results + a private log back to social-hub, and prints only a status line (public logs never show data).
+on:
+  schedule:
+    - cron: "3 4 * * *"          # 04:03 UTC = 09:33 Sri Lanka
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "check | dry-run | test | publish"
+        default: "check"
+      episode:
+        description: "episode number (test upload, or publish only this episode); empty = all due episodes"
+        default: ""
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  job:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: devsuresh120-coder/social-hub
+          token: ${{ secrets.HUB_TOKEN }}
+          path: hub
+          sparse-checkout: data/byte-files
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Put the code next to the data (not committed)
+        run: cp -r publish tools hub/data/byte-files/
+      - run: pip install -q requests > /dev/null
+      - name: Schedule on Facebook (output goes to the private log only)
+        working-directory: hub/data/byte-files
+        env:
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+          FB_AUTO: ${{ vars.FB_AUTO || secrets.FB_AUTO }}
+          DRY_RUN: ${{ github.event.inputs.action == 'dry-run' && '1' || '' }}
+          TEST_MODE: ${{ github.event.inputs.action == 'test' && '1' || '' }}
+          TEST_EPISODE: ${{ github.event.inputs.episode }}
+          ONLY_EPISODE: ${{ github.event.inputs.action == 'publish' && github.event.inputs.episode || '' }}
+          CHECK_ONLY: ${{ github.event.inputs.action == 'check' && '1' || '' }}
+        run: |
+          mkdir -p logs; LOG="logs/publish-long_$(date -u +%Y%m%d_%H%M%S).txt"
+          set +e
+          {
+            python publish/publish_long.py
+          } > "$LOG" 2>&1
+          code=$?
+          ls -1t logs/publish-long_*.txt | tail -n +31 | xargs -r rm -f   # keep the last 30 logs
+          echo "STATUS=$code" >> "$GITHUB_ENV"
+          if [ $code -eq 0 ]; then echo "publish-long: ok"; else echo "::error::publish-long failed (details in social-hub/data/byte-files/$LOG)"; fi
+      - name: Save results to social-hub (private)
+        if: always()
+        working-directory: hub
+        run: |
+          git config user.name "byte-files-bot"
+          git config user.email "bot@users.noreply.github.com"
+          for p in data/byte-files/logs data/byte-files/queue/posted.json data/byte-files/queue/fb_scheduled.json; do git add -A -f "$p" > /dev/null 2>&1 || true; done
+          if ! git diff --cached --quiet; then
+            git commit -qm "byte-files: long episodes scheduled on Facebook [skip ci]"
+            for i in 1 2 3 4 5; do git pull -q --rebase --autostash && git push -q && break; sleep 5; done
+          fi
+          exit "${STATUS:-0}"

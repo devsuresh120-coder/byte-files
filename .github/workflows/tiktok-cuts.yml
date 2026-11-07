@@ -1,0 +1,81 @@
+name: Make TikTok cuts (over 10 min)
+
+# PUBLIC repo: only code. Buffer only takes TikTok videos up to 10 minutes. For each episode given, this makes a TikTok-only
+# cut from the R2 video, uploads it to R2 and points the TikTok row (in the private repo social-hub, data/byte-files/) at it.
+on:
+  workflow_dispatch:
+    inputs:
+      episodes:
+        description: "episode numbers, comma separated (e.g. 5,2,6)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      eps: ${{ steps.p.outputs.eps }}
+    steps:
+      - id: p
+        env:
+          EPS: ${{ github.event.inputs.episodes }}
+        run: echo "eps=$(echo "$EPS" | python3 -c 'import sys,json; print(json.dumps([int(x) for x in sys.stdin.read().replace(" ","").split(",") if x]))')" >> "$GITHUB_OUTPUT"
+  cut:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        ep: ${{ fromJson(needs.plan.outputs.eps) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: devsuresh120-coder/social-hub
+          token: ${{ secrets.HUB_TOKEN }}
+          path: hub
+          sparse-checkout: data/byte-files
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get -qq update && sudo apt-get -qq install -y ffmpeg >/dev/null && pip install -q boto3 && cp -r publish tools hub/data/byte-files/
+      - name: Cut, upload to R2, point the TikTok row at the cut (output goes nowhere public)
+        working-directory: hub/data/byte-files
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          EP: ${{ matrix.ep }}
+        run: |
+          set +e
+          mkdir -p logs; LOG="logs/tiktok-cut_${EP}_$(date -u +%Y%m%d_%H%M%S).txt"
+          {
+            set -e
+            python3 tools/tiktok_cut.py "$EP" /tmp/cut
+            FOLDER=$(python3 -c "import json;print(json.load(open('/tmp/cut/cut.json'))['folder'])")
+            mv /tmp/cut/cut.json /tmp/cut.json
+            echo '{}' > /tmp/new_r2.json
+            if ls /tmp/cut/*.mp4 >/dev/null 2>&1; then RELEASE_TAG="$FOLDER" SRC_DIR=/tmp/cut R2_JSON=/tmp/new_r2.json python tools/r2_upload.py; fi
+            cd ../..
+            git config user.name "byte-files-bot"; git config user.email "bot@users.noreply.github.com"
+            ok=0
+            for i in 1 2 3 4 5 6; do
+              git pull -q --rebase --autostash
+              (cd data/byte-files && python3 tools/tiktok_cut_apply.py /tmp/cut.json /tmp/new_r2.json)
+              git add data/byte-files/queue/schedule.csv data/byte-files/queue/r2.json
+              if git diff --cached --quiet; then ok=1; break; fi
+              git commit -qm "byte-files: TikTok cut for ep $EP [skip ci]"
+              if git push -q; then ok=1; break; fi
+              git reset -q --hard HEAD~1; sleep $((RANDOM % 10 + 5))
+            done
+            [ $ok -eq 1 ]
+          } > "$LOG" 2>&1
+          code=$?
+          cd "$GITHUB_WORKSPACE/hub" && git add -A -f data/byte-files/logs >/dev/null 2>&1; git diff --cached --quiet || { git commit -qm "byte-files: tiktok cut log [skip ci]"; for i in 1 2 3 4 5; do git pull -q --rebase --autostash && git push -q && break; sleep 5; done; }
+          if [ $code -eq 0 ]; then echo "tiktok-cut: ok"; else echo "::error::tiktok-cut failed (details in social-hub/data/byte-files/logs)"; exit 1; fi
