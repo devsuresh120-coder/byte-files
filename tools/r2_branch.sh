@@ -4,6 +4,8 @@ set -e
 B="$1"
 echo "== branch $B"
 git fetch -q --depth=1 origin "$B"
+# social-hub upload/* branches are shared by several series: skip ones that are not for byte-files
+if ! git cat-file -e "FETCH_HEAD:data/byte-files/_upload" 2>/dev/null; then echo "skip (not byte-files)"; exit 0; fi
 git checkout -q FETCH_HEAD -- data/byte-files/_upload
 cp data/byte-files/queue/r2.json /tmp/r2.json 2>/dev/null || echo '{}' > /tmp/r2.json
 for d in data/byte-files/_upload/*/; do
